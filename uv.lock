@@ -1,0 +1,34 @@
+version = 1
+requires-python = ">=3.8"
+
+[[package]]
+name = "appeal"
+version = "0.6.3"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "big" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/27/a0/675604f94ba66395c39840c04b55a10f4f9053f8c21df4cf11a36bfc7c29/appeal-0.6.3.tar.gz", hash = "sha256:fb34edffcc0358948e72f289dda3dca91476f303423022514356cf0338f9b9e1", size = 233156 }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/69/5d/cce8afb07b1c5fa3d08f2def0edee3a04dcf123922325952f12e002208b6/appeal-0.6.3-py3-none-any.whl", hash = "sha256:f60293d7e1c0ed5fa3574c9e0fdf96511e80fcecf7c8f5906d0c0ff66f7271ff", size = 104609 },
+]
+
+[[package]]
+name = "big"
+version = "0.12.7"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/8d/ab/5563e1dc51edf65093c411cc04e439f6bfa9817dfe4d9a7037c0296591e0/big-0.12.7.tar.gz", hash = "sha256:d7215ea42d8a7db36f6ba94cb3d0d279984e6be6e246b17985233ec231ef3924", size = 4888834 }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/ac/a9/1940702b16caf2ed91ed46602e30a3135146b3b53f8f20f4007eb9ef7a14/big-0.12.7-py3-none-any.whl", hash = "sha256:84fad40a45aafc4d5015a573cbc617f4b94b1cfab94d0fe630978bfcc8b7b26c", size = 173901 },
+]
+
+[[package]]
+name = "shift-gifs"
+version = "0.1.0"
+source = { editable = "." }
+dependencies = [
+    { name = "appeal" },
+]
+
+[package.metadata]
+requires-dist = [{ name = "appeal", specifier = ">=0.6.3" }]
