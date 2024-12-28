@@ -100,7 +100,7 @@ def _handle_ffprobe_error(msg: str) -> None:
     raise VideoProcessingError(msg)
 
 
-def get_video_info(file_path: Path) -> dict:
+async def get_video_info(file_path: Path) -> dict:
     """Get video information using ffprobe."""
     logger.info("Getting video info for: {}", file_path)
     try:
@@ -116,10 +116,7 @@ def get_video_info(file_path: Path) -> dict:
         )
 
         # Execute ffprobe and get output
-        result = ffprobe.execute()
-
-        # Parse the JSON output
-        stdout = result[0] if isinstance(result, tuple) else result
+        stdout = await ffprobe.execute()
 
         if not stdout:
             _handle_ffprobe_error("FFprobe returned no output")
@@ -141,7 +138,7 @@ def get_video_info(file_path: Path) -> dict:
             )
 
         fps = float(fps_parts[0]) / float(fps_parts[1])
-
+        
         # Get bitrate, fallback to format bitrate if stream bitrate is not available
         bitrate = stream_info.get("bit_rate")
         if not bitrate:
@@ -194,7 +191,7 @@ async def create_phase_grid(
         logger.info("Grid dimensions: {}x{}", cols, rows)
 
         # Get video information
-        info = get_video_info(input_path)
+        info = await get_video_info(input_path)
         duration = info["duration"]
 
         # Calculate new bitrate for the grid
@@ -297,7 +294,7 @@ async def create_phase_grid(
                 await ffmpeg.execute()
 
         # Verify output dimensions
-        output_info = get_video_info(output_path)
+        output_info = await get_video_info(output_path)
         expected_width = info["width"] * cols
         expected_height = info["height"] * rows
 
