@@ -7,7 +7,7 @@ import logging
 import os
 import sys
 from pathlib import Path
-from typing import Annotated, Any, Optional, Union
+from typing import Annotated, Any, Literal, Optional, Union
 
 import appeal
 from ffmpeg.asyncio import FFmpeg
@@ -179,7 +179,12 @@ def _verify_output_dimensions(
         _handle_ffprobe_error(msg)
 
 
-def _create_filter_complex(cols: int, rows: int, duration: float, is_output_gif: bool = False) -> str:
+def _create_filter_complex(
+        cols: int,
+        rows: int,
+        duration: float,
+        output_type: Literal["gif", "video"] = "video",
+    ) -> str:
     """Create the FFmpeg filter complex string."""
     total_frames = cols * rows
     filter_complex = []
@@ -208,13 +213,13 @@ def _create_filter_complex(cols: int, rows: int, duration: float, is_output_gif:
     layout_str = "|".join(layout)
 
     # For GIFs, ensure proper frame timing with fps filter
-    if is_output_gif:
+    if output_type == "gif":
         filter_complex.append(
-            f"{inputs}xstack=inputs={total_frames}:layout={layout_str}:shortest=1,fps=30[v]"
+            f"{inputs}xstack=inputs={total_frames}:layout={layout_str}:shortest=1,fps=30[v]",
         )
     else:
         filter_complex.append(
-            f"{inputs}xstack=inputs={total_frames}:layout={layout_str}:shortest=1[v]"
+            f"{inputs}xstack=inputs={total_frames}:layout={layout_str}:shortest=1[v]",
         )
 
     return ";".join(filter_complex)
@@ -236,9 +241,10 @@ async def create_phase_grid(
         # Get video information
         info = await get_video_info(input_path)
         duration = info["duration"]
-        fps = info["fps"]
+        info["fps"]
 
-        filter_complex_str = _create_filter_complex(cols, rows, duration, is_output_gif)
+        filter_complex_str = _create_filter_complex(cols, rows, duration,
+            output_type="gif" if is_output_gif else "video")
 
         # Initialize progress bar
         pbar = tqdm(
@@ -309,18 +315,7 @@ async def create_phase_grid(
                 logger.exception("Progress update failed")
 
         try:
-            process = await asyncio.create_subprocess_exec(
-                *ffmpeg.arguments,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE
-            )
-            stdout, stderr = await process.communicate()
-            logger.error("FFmpeg stderr: {}", stderr.decode() if stderr else "None")
-            logger.error("FFmpeg return code: {}", process.returncode)
-
-            if process.returncode != 0:
-                raise Exception(f"FFmpeg failed with return code {process.returncode}")
-
+            await ffmpeg.execute()
 
         finally:
             pbar.close()
