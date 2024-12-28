@@ -7,7 +7,8 @@ authors = [
 ]
 dependencies = [
     "appeal>=0.6.3",
-    "python-ffmpeg"
+    "python-ffmpeg",
+    "tqdm"
 ]
 requires-python = ">=3.8"
 

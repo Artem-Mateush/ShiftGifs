@@ -1,4 +1,4 @@
-```# ShiftGifs
+# ShiftGifs
 
 Create phase-shifted video grids using python-ffmpeg.
 

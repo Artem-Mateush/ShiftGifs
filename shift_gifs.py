@@ -1,15 +1,17 @@
 #!/usr/bin/env python3
 """Create phase-shifted video grids using python-ffmpeg."""
 
+import asyncio
 import json
 import logging
 import os
 import sys
 from pathlib import Path
-from typing import Annotated, Optional, Union
+from typing import Annotated, Any, Optional, Union
 
 import appeal
-from ffmpeg import FFmpeg
+from ffmpeg.asyncio import FFmpeg
+from tqdm import tqdm
 
 
 # Constants
@@ -46,6 +48,17 @@ def setup_logging(*, verbose:bool=False) -> None:
 logger = logging.getLogger(__name__)
 app = appeal.Appeal()
 
+def _parse_progress_line(line: str) -> dict:
+    """Parse a single line of FFmpeg progress output."""
+    if not line:
+        return {}
+
+    # Split the line into key-value pairs
+    parts = line.decode("utf-8").strip().split("=")
+    if len(parts) != 2: # noqa:PLR2004
+        return {}
+
+    return {parts[0]: parts[1]}
 
 class VideoProcessingError(Exception):
     """Raised when video processing fails."""
@@ -85,7 +98,7 @@ def _handle_ffprobe_error(msg: str) -> None:
     raise VideoProcessingError(msg)
 
 
-def get_video_info(file_path: Path) -> dict:
+async def get_video_info(file_path: Path) -> dict:
     """Get video information using ffprobe."""
     logger.info("Getting video info for: {}", file_path)
     try:
@@ -94,16 +107,14 @@ def get_video_info(file_path: Path) -> dict:
             FFmpeg(executable="ffprobe")
             .option("v", "error")
             .option("select_streams", "v:0")
-            .option("show_entries", "stream=width,height,r_frame_rate:format=duration")
+            .option("show_entries", "stream=width,height,r_frame_rate"
+                    ",bit_rate:format=duration")
             .option("of", "json")
             .input(str(file_path))
         )
 
         # Execute ffprobe and get output
-        result = ffprobe.execute()
-
-        # Parse the JSON output
-        stdout = result[0] if isinstance(result, tuple) else result
+        stdout = await ffprobe.execute()
 
         if not stdout:
             _handle_ffprobe_error("FFprobe returned no output")
@@ -126,11 +137,18 @@ def get_video_info(file_path: Path) -> dict:
 
         fps = float(fps_parts[0]) / float(fps_parts[1])
 
+        # Get bitrate, fallback to format bitrate if stream bitrate is not available
+        bitrate = stream_info.get("bit_rate")
+        if not bitrate:
+            # If stream bitrate is not available, try format bitrate
+            bitrate = format_info.get("bit_rate")
+
         info = {
             "duration": float(format_info["duration"]),
             "width": int(stream_info["width"]),
             "height": int(stream_info["height"]),
             "fps": fps,
+            "bitrate": bitrate,
         }
         logger.info("Video info: {}", info)
     except Exception as e:
@@ -155,8 +173,42 @@ def _verify_output_dimensions(
         )
         _handle_ffprobe_error(msg)
 
+def _create_filter_complex(cols: int, rows: int, duration: float) -> str:
+    """Create the FFmpeg filter complex string."""
+    total_frames = cols * rows
+    filter_complex = []
 
-def create_phase_grid(
+    # Split input into streams
+    splits = [f"[in{i}]" for i in range(total_frames)]
+    filter_complex.append(f'split={total_frames}{"".join(splits)}')
+
+    # Create phase-shifted versions
+    for i in range(total_frames):
+        shift = duration - (i * duration / total_frames)
+        filter_complex.extend([
+            f"[in{i}]trim=start={shift},setpts=PTS-STARTPTS[p{i}a]",
+            f"[in{i}]trim=duration={shift},setpts=PTS-STARTPTS[p{i}b]",
+            f"[p{i}a][p{i}b]concat[v{i}]",
+        ])
+
+    # Create layout for xstack
+    inputs = "".join(f"[v{i}]" for i in range(total_frames))
+    layout = []
+    for row in range(rows):
+        for col in range(cols):
+            x = "0" if col == 0 else "+".join(f"w{i}" for i in range(col))
+            y = "0" if row == 0 else "+".join(f"h{i}" for i in range(row))
+            layout.append(f"{x}_{y}")
+    layout_str = "|".join(layout)
+
+    filter_complex.append(
+        f"{inputs}xstack=inputs={total_frames}:layout={layout_str}:shortest=1[vs]",
+    )
+    filter_complex.append("[vs]format=yuv420p[v]")
+
+    return ";".join(filter_complex)
+
+async def create_phase_grid(
     input_file: Union[str, Path],
     output_file: Union[str, Path],
     cols: int = DEFAULT_COLS,
@@ -171,74 +223,75 @@ def create_phase_grid(
         logger.info("Grid dimensions: {}x{}", cols, rows)
 
         # Get video information
-        info = get_video_info(input_path)
+        info = await get_video_info(input_path)
         duration = info["duration"]
 
-        # Build filter complex
-        total_frames = cols * rows
-        filter_complex = []
+        # Calculate new bitrate for the grid
+        # Since we're creating a larger video, we should scale the bitrate
+        # proportionally to maintain quality
+        input_bitrate = info.get("bitrate")
+        if input_bitrate:
+            # Scale bitrate according to the number of grid cells
+            # Convert to int since some FFmpeg versions require integer bitrate
+            new_bitrate = int(int(input_bitrate) * (cols * rows))
+            logger.info("Scaling input bitrate {} to {} for grid",
+              input_bitrate, new_bitrate)
 
-        # Split input into streams
-        splits = [f"[in{i}]" for i in range(total_frames)]
-        filter_complex.append(f'split={total_frames}{"".join(splits)}')
+        filter_complex_str = _create_filter_complex(cols, rows, duration)
 
-        # Create phase-shifted versions
-        for i in range(total_frames):
-            shift = duration - (i * duration / total_frames)
-            filter_complex.extend(
-                [
-                    f"[in{i}]trim=start={shift},setpts=PTS-STARTPTS[p{i}a]",
-                    f"[in{i}]trim=duration={shift},setpts=PTS-STARTPTS[p{i}b]",
-                    f"[p{i}a][p{i}b]concat[v{i}]",
-                ],
-            )
-
-        # Create layout for xstack
-        inputs = "".join(f"[v{i}]" for i in range(total_frames))
-        layout = []
-        for row in range(rows):
-            for col in range(cols):
-                x = "0" if col == 0 else "+".join(f"w{i}" for i in range(col))
-                y = "0" if row == 0 else "+".join(f"h{i}" for i in range(row))
-                layout.append(f"{x}_{y}")
-        layout_str = "|".join(layout)
-
-        # Add xstack filter
-        filter_complex.append(
-            f"{inputs}xstack=inputs={total_frames}:layout={layout_str}:shortest=1[vs]",
+        # Initialize progress bar outside the FFmpeg execution
+        pbar = tqdm(
+            total=100,
+            desc="Processing video",
+            bar_format="{l_bar}{bar}| {n_fmt}%",
+            unit="%",
         )
-        filter_complex.append("[vs]format=yuv420p[v]")
 
-        # Join all filters
-        filter_complex_str = ";".join(filter_complex)
-        logger.debug("Filter complex: {}", filter_complex_str)
+        ffmpeg_options = {
+            "filter_complex": filter_complex_str,
+            "map": "[v]",
+            "t": str(duration),
+            "c:v": "libx264",
+            "preset": "medium",
+        }
 
-        # Create FFmpeg command
+        if input_bitrate:
+            ffmpeg_options["b:v"] = str(new_bitrate)
+
         ffmpeg = (
             FFmpeg()
             .option("y")
             .option("stream_loop", "-1")
             .input(str(input_path))
-            .output(
-                str(output_path),
-                {"filter_complex": filter_complex_str},
-                map="[v]",
-                t=str(duration),
-                **{"c:v": "libx264", "preset": "medium"},
-            )
+            .output(str(output_path), ffmpeg_options)
         )
 
-        # Execute FFmpeg command
-        result = ffmpeg.execute()
+        last_progress = 0
 
-        # Handle potential stderr output
-        if isinstance(result, tuple) and len(result) > 1:
-            stderr = result[1]
-            if stderr:
-                logger.warning("FFmpeg stderr: {}", stderr)
+        @ffmpeg.on("progress")
+        def on_progress(progress: Any) -> None: # noqa: ANN401
+            nonlocal last_progress
+            try:
+                 # Convert timedelta to seconds
+                current_time = progress.time.total_seconds()
+                current_progress = min(100, int((current_time / duration) * 100))
+
+                # Update progress bar
+                if current_progress > last_progress:
+                    pbar.update(current_progress - last_progress)
+                    last_progress = current_progress
+            except (AttributeError, TypeError, ValueError):
+                logger.exception("Progress update failed")
+
+        try:
+            # Execute FFmpeg
+            await ffmpeg.execute()
+        finally:
+            # Make sure to close the progress bar
+            pbar.close()
 
         # Verify output dimensions
-        output_info = get_video_info(output_path)
+        output_info = await get_video_info(output_path)
         expected_width = info["width"] * cols
         expected_height = info["height"] * rows
 
@@ -250,6 +303,16 @@ def create_phase_grid(
         logger.exception(str(error))
         raise error from e
 
+# Modify the main entry point to handle async
+def process_video(
+    input_file: Union[str, Path],
+    output_file: Union[str, Path],
+    cols: int = DEFAULT_COLS,
+    rows: int = DEFAULT_ROWS,
+) -> None:
+    """Wrapper function to run the async create_phase_grid."""
+    asyncio.run(create_phase_grid(input_file, output_file, cols, rows))
+
 
 def _validate_geometry(cols: int, rows: int) -> None:
     """Validate the geometry values are positive."""
@@ -259,7 +322,7 @@ def _validate_geometry(cols: int, rows: int) -> None:
 
 
 @app.global_command()
-def phase_grid(
+def shift_gifs(
     input_file: str,
     output_file: Annotated[Optional[str], str] = None,
     *,
@@ -288,7 +351,7 @@ def phase_grid(
         logger.info("Starting grid creation: {}", geometry)
         cols, rows = map(int, geometry.split("x"))
         _validate_geometry(cols, rows)
-        create_phase_grid(input_file, output_file, cols, rows)
+        process_video(input_file, output_file, cols, rows)
         logger.info("Processing completed")
     except Exception:
         logger.exception("Processing failed")
