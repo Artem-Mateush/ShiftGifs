@@ -134,9 +134,9 @@ def get_video_info(file_path: Path) -> dict:
         }
         logger.info("Video info: {}", info)
     except Exception as e:
-        logger.exception("Failed to get video information")
-        msg = f"Failed to get video information: {e!s}"
-        raise VideoProcessingError(msg) from e
+        error = VideoProcessingError(f"Failed to get video information: {e!s}")
+        logger.exception(str(error))
+        raise error from e
     else:
         return info
 
@@ -246,9 +246,9 @@ def create_phase_grid(
         logger.info("Video processing completed successfully")
 
     except Exception as e:
-        logger.exception("Video processing failed")
-        msg = f"Video processing failed: {e!s}"
-        raise VideoProcessingError(msg) from e
+        error = VideoProcessingError(f"Video processing failed: {e!s}")
+        logger.exception(str(error))
+        raise error from e
 
 
 def _validate_geometry(cols: int, rows: int) -> None:
