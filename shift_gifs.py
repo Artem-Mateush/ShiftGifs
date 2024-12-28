@@ -7,7 +7,7 @@ import logging
 import os
 import sys
 from pathlib import Path
-from typing import Annotated, Optional, Union
+from typing import Annotated, Any, Optional, Union
 
 import appeal
 from ffmpeg.asyncio import FFmpeg
@@ -55,7 +55,7 @@ def _parse_progress_line(line: str) -> dict:
 
     # Split the line into key-value pairs
     parts = line.decode("utf-8").strip().split("=")
-    if len(parts) != 2:
+    if len(parts) != 2: # noqa:PLR2004
         return {}
 
     return {parts[0]: parts[1]}
@@ -173,6 +173,40 @@ def _verify_output_dimensions(
         )
         _handle_ffprobe_error(msg)
 
+def _create_filter_complex(cols: int, rows: int, duration: float) -> str:
+    """Create the FFmpeg filter complex string."""
+    total_frames = cols * rows
+    filter_complex = []
+
+    # Split input into streams
+    splits = [f"[in{i}]" for i in range(total_frames)]
+    filter_complex.append(f'split={total_frames}{"".join(splits)}')
+
+    # Create phase-shifted versions
+    for i in range(total_frames):
+        shift = duration - (i * duration / total_frames)
+        filter_complex.extend([
+            f"[in{i}]trim=start={shift},setpts=PTS-STARTPTS[p{i}a]",
+            f"[in{i}]trim=duration={shift},setpts=PTS-STARTPTS[p{i}b]",
+            f"[p{i}a][p{i}b]concat[v{i}]",
+        ])
+
+    # Create layout for xstack
+    inputs = "".join(f"[v{i}]" for i in range(total_frames))
+    layout = []
+    for row in range(rows):
+        for col in range(cols):
+            x = "0" if col == 0 else "+".join(f"w{i}" for i in range(col))
+            y = "0" if row == 0 else "+".join(f"h{i}" for i in range(row))
+            layout.append(f"{x}_{y}")
+    layout_str = "|".join(layout)
+
+    filter_complex.append(
+        f"{inputs}xstack=inputs={total_frames}:layout={layout_str}:shortest=1[vs]",
+    )
+    filter_complex.append("[vs]format=yuv420p[v]")
+
+    return ";".join(filter_complex)
 
 async def create_phase_grid(
     input_file: Union[str, Path],
@@ -203,44 +237,7 @@ async def create_phase_grid(
             logger.info("Scaling input bitrate {} to {} for grid",
               input_bitrate, new_bitrate)
 
-        # Build filter complex
-        total_frames = cols * rows
-        filter_complex = []
-
-        # Split input into streams
-        splits = [f"[in{i}]" for i in range(total_frames)]
-        filter_complex.append(f'split={total_frames}{"".join(splits)}')
-
-        # Create phase-shifted versions
-        for i in range(total_frames):
-            shift = duration - (i * duration / total_frames)
-            filter_complex.extend(
-                [
-                    f"[in{i}]trim=start={shift},setpts=PTS-STARTPTS[p{i}a]",
-                    f"[in{i}]trim=duration={shift},setpts=PTS-STARTPTS[p{i}b]",
-                    f"[p{i}a][p{i}b]concat[v{i}]",
-                ],
-            )
-
-        # Create layout for xstack
-        inputs = "".join(f"[v{i}]" for i in range(total_frames))
-        layout = []
-        for row in range(rows):
-            for col in range(cols):
-                x = "0" if col == 0 else "+".join(f"w{i}" for i in range(col))
-                y = "0" if row == 0 else "+".join(f"h{i}" for i in range(row))
-                layout.append(f"{x}_{y}")
-        layout_str = "|".join(layout)
-
-        # Add xstack filter
-        filter_complex.append(
-            f"{inputs}xstack=inputs={total_frames}:layout={layout_str}:shortest=1[vs]",
-        )
-        filter_complex.append("[vs]format=yuv420p[v]")
-
-        # Join all filters
-        filter_complex_str = ";".join(filter_complex)
-        logger.debug("Filter complex: {}", filter_complex_str)
+        filter_complex_str = _create_filter_complex(cols, rows, duration)
 
         # Initialize progress bar outside the FFmpeg execution
         pbar = tqdm(
@@ -272,7 +269,7 @@ async def create_phase_grid(
         last_progress = 0
 
         @ffmpeg.on("progress")
-        def on_progress(progress):
+        def on_progress(progress: Any) -> None: # noqa: ANN401
             nonlocal last_progress
             try:
                  # Convert timedelta to seconds
@@ -283,8 +280,8 @@ async def create_phase_grid(
                 if current_progress > last_progress:
                     pbar.update(current_progress - last_progress)
                     last_progress = current_progress
-            except Exception as e:
-                logger.warning(f"Progress update failed: {e}")
+            except (AttributeError, TypeError, ValueError):
+                logger.exception("Progress update failed")
 
         try:
             # Execute FFmpeg
