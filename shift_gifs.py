@@ -6,7 +6,7 @@ import logging
 import os
 import sys
 from pathlib import Path
-from typing import Literal, Optional, Union
+from typing import Annotated, Optional, Union
 
 import appeal
 from ffmpeg import FFmpeg
@@ -29,13 +29,13 @@ class BraceLogRecord(logging.LogRecord):
 
 LOG_FORMAT = "%(asctime)s - %(levelname)s - %(message)s"
 
-def setup_logging(mode: Literal["quiet", "verbose"]) -> None:
+def setup_logging(*, verbose:bool=False) -> None:
     """Configure logging based on verbosity mode."""
     logging.setLogRecordFactory(BraceLogRecord)
 
     logger.handlers.clear()
 
-    if mode == "verbose":
+    if verbose:
         handler = logging.StreamHandler(sys.stdout)
         handler.setFormatter(logging.Formatter(LOG_FORMAT))
         logger.addHandler(handler)
@@ -261,12 +261,29 @@ def _validate_geometry(cols: int, rows: int) -> None:
 @app.global_command()
 def phase_grid(
     input_file: str,
-    output_file: str,
+    output_file: Annotated[Optional[str], str] = None,
+    *,
     geometry: str = f"{DEFAULT_COLS}x{DEFAULT_ROWS}",
-    mode: Literal["quiet", "verbose"] = "quiet",
+    verbose: bool = False,
 ) -> Optional[int]:
-    """Create a grid of phase-shifted videos."""
-    setup_logging(mode)
+    """Create a grid of phase-shifted videos.
+
+    Args:
+        input_file: Path to input video file
+        output_file: Path to output video file.
+          If not provided, will use input path with '_shifted' suffix
+        geometry: Grid dimensions in format 'COLSxROWS',
+          e.g. '3x2' for 3 columns and 2 rows
+        verbose: Verbose logging output
+    """
+    if output_file is None:
+        # Get input path without extension
+        input_path = Path(input_file)
+        stem = input_path.stem
+        # Create output path with _shifted suffix and same extension
+        output_file = str(input_path.with_stem(f"{stem}_shifted"))
+
+    setup_logging(verbose=verbose)
     try:
         logger.info("Starting grid creation: {}", geometry)
         cols, rows = map(int, geometry.split("x"))
@@ -275,9 +292,9 @@ def phase_grid(
         logger.info("Processing completed")
     except Exception:
         logger.exception("Processing failed")
+        return 1
     else:
         return None
-
 
 if __name__ == "__main__":
     app.main()
