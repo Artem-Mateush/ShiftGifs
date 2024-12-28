@@ -11,7 +11,8 @@ from pathlib import Path
 from typing import Annotated, Optional, Union
 
 import appeal
-from ffmpeg import FFmpeg
+import asyncio
+from ffmpeg.asyncio import FFmpeg
 from tqdm import tqdm
 
 
@@ -178,7 +179,7 @@ def _verify_output_dimensions(
         _handle_ffprobe_error(msg)
 
 
-def create_phase_grid(
+async def create_phase_grid(
     input_file: Union[str, Path],
     output_file: Union[str, Path],
     cols: int = DEFAULT_COLS,
@@ -248,7 +249,6 @@ def create_phase_grid(
 
         # Create a temporary file for progress output
         with tempfile.NamedTemporaryFile(mode='w+b', delete=True) as progress_file:
-            # Create FFmpeg command with progress output
             ffmpeg_options = {
                 "filter_complex": filter_complex_str,
                 "map": "[v]",
@@ -266,14 +266,8 @@ def create_phase_grid(
                 .option("stream_loop", "-1")
                 .option("progress", progress_file.name)
                 .input(str(input_path))
-                .output(
-                    str(output_path),
-                    ffmpeg_options,
-                )
+                .output(str(output_path), ffmpeg_options)
             )
-
-            # Start FFmpeg process
-            process = ffmpeg.execute(overwrite_output=True, pipe=True)
 
             # Initialize progress bar
             with tqdm(
@@ -284,41 +278,23 @@ def create_phase_grid(
             ) as pbar:
                 last_progress = 0
                 
-                # Monitor progress file
-                while True:
-                    # Check if process is still running
-                    if process.poll() is not None:
-                        break
+                @ffmpeg.on('progress')
+                def on_progress(progress):
+                    nonlocal last_progress
+                    try:
+                        # Calculate progress based on time
+                        time_ms = progress.time * 1000000  # Convert to microseconds
+                        current_progress = min(100, int((time_ms / 1000000) / duration * 100))
                         
-                    # Read progress file
-                    progress_file.seek(0)
-                    progress_lines = progress_file.readlines()
-                    
-                    # Parse progress information
-                    progress_info = {}
-                    for line in progress_lines:
-                        progress_info.update(_parse_progress_line(line))
-                    
-                    # Calculate progress percentage
-                    if 'out_time_ms' in progress_info:
-                        try:
-                            time_ms = int(progress_info['out_time_ms'])
-                            current_progress = min(100, int((time_ms / 1000000) / duration * 100))
-                            
-                            # Update progress bar
-                            if current_progress > last_progress:
-                                pbar.update(current_progress - last_progress)
-                                last_progress = current_progress
-                        except (ValueError, ZeroDivisionError):
-                            continue
-                            
-                    # Small sleep to prevent excessive CPU usage
-                    process.stdout.flush()
-                    process.stderr.flush()
-                    
-            # Check if process completed successfully
-            if process.returncode != 0:
-                raise VideoProcessingError(f"FFmpeg process failed with return code {process.returncode}")
+                        # Update progress bar
+                        if current_progress > last_progress:
+                            pbar.update(current_progress - last_progress)
+                            last_progress = current_progress
+                    except (AttributeError, TypeError, ZeroDivisionError):
+                        pass
+
+                # Execute FFmpeg
+                await ffmpeg.execute()
 
         # Verify output dimensions
         output_info = get_video_info(output_path)
@@ -333,6 +309,16 @@ def create_phase_grid(
         logger.exception(str(error))
         raise error from e
 
+# Modify the main entry point to handle async
+def process_video(
+    input_file: Union[str, Path],
+    output_file: Union[str, Path],
+    cols: int = DEFAULT_COLS,
+    rows: int = DEFAULT_ROWS,
+) -> None:
+    """Wrapper function to run the async create_phase_grid."""
+    asyncio.run(create_phase_grid(input_file, output_file, cols, rows))
+
 
 def _validate_geometry(cols: int, rows: int) -> None:
     """Validate the geometry values are positive."""
@@ -342,7 +328,7 @@ def _validate_geometry(cols: int, rows: int) -> None:
 
 
 @app.global_command()
-def phase_grid(
+def shift_gifs(
     input_file: str,
     output_file: Annotated[Optional[str], str] = None,
     *,
@@ -371,7 +357,7 @@ def phase_grid(
         logger.info("Starting grid creation: {}", geometry)
         cols, rows = map(int, geometry.split("x"))
         _validate_geometry(cols, rows)
-        create_phase_grid(input_file, output_file, cols, rows)
+        process_video(input_file, output_file, cols, rows)
         logger.info("Processing completed")
     except Exception:
         logger.exception("Processing failed")
