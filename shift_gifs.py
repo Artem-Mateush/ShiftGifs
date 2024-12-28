@@ -64,6 +64,11 @@ class VideoProcessingError(Exception):
     """Raised when video processing fails."""
 
 
+def is_gif(file_path: Path) -> bool:
+    """Check if the file is a GIF."""
+    return file_path.suffix.lower() == '.gif'
+
+
 def validate_input_file(file_path: Union[str, Path]) -> Path:
     """Validate and resolve input file path."""
     try:
@@ -173,6 +178,7 @@ def _verify_output_dimensions(
         )
         _handle_ffprobe_error(msg)
 
+
 def _create_filter_complex(cols: int, rows: int, duration: float) -> str:
     """Create the FFmpeg filter complex string."""
     total_frames = cols * rows
@@ -204,9 +210,12 @@ def _create_filter_complex(cols: int, rows: int, duration: float) -> str:
     filter_complex.append(
         f"{inputs}xstack=inputs={total_frames}:layout={layout_str}:shortest=1[vs]",
     )
-    filter_complex.append("[vs]format=yuv420p[v]")
+    
+    # For GIFs, we don't need yuv420p format
+    filter_complex.append("[vs]split[v]")
 
     return ";".join(filter_complex)
+
 
 async def create_phase_grid(
     input_file: Union[str, Path],
@@ -218,6 +227,8 @@ async def create_phase_grid(
     try:
         input_path = validate_input_file(input_file)
         output_path = validate_output_file(output_file)
+        is_input_gif = is_gif(input_path)
+        is_output_gif = is_gif(output_path)
 
         logger.info("Processing video: {} -> {}", input_path, output_path)
         logger.info("Grid dimensions: {}x{}", cols, rows)
@@ -226,20 +237,18 @@ async def create_phase_grid(
         info = await get_video_info(input_path)
         duration = info["duration"]
 
-        # Calculate new bitrate for the grid
-        # Since we're creating a larger video, we should scale the bitrate
-        # proportionally to maintain quality
-        input_bitrate = info.get("bitrate")
-        if input_bitrate:
-            # Scale bitrate according to the number of grid cells
-            # Convert to int since some FFmpeg versions require integer bitrate
-            new_bitrate = int(int(input_bitrate) * (cols * rows))
-            logger.info("Scaling input bitrate {} to {} for grid",
-              input_bitrate, new_bitrate)
+        # Calculate new bitrate for the grid (only for non-GIF outputs)
+        new_bitrate = None
+        if not is_output_gif:
+            input_bitrate = info.get("bitrate")
+            if input_bitrate:
+                new_bitrate = int(int(input_bitrate) * (cols * rows))
+                logger.info("Scaling input bitrate {} to {} for grid",
+                    input_bitrate, new_bitrate)
 
         filter_complex_str = _create_filter_complex(cols, rows, duration)
 
-        # Initialize progress bar outside the FFmpeg execution
+        # Initialize progress bar
         pbar = tqdm(
             total=100,
             desc="Processing video",
@@ -247,24 +256,46 @@ async def create_phase_grid(
             unit="%",
         )
 
-        ffmpeg_options = {
+        # Create FFmpeg command
+        ffmpeg = FFmpeg().option("y")
+
+        # Add input options for GIF
+        if is_input_gif:
+            ffmpeg = (
+                ffmpeg
+                .option("stream_loop", "-1")
+                .option("ignore_loop", "0")
+                .option("pattern_type", "none")
+            )
+        else:
+            ffmpeg = ffmpeg.option("stream_loop", "-1")
+
+        # Add input
+        ffmpeg = ffmpeg.input(str(input_path))
+
+        # Output options
+        output_options = {
             "filter_complex": filter_complex_str,
             "map": "[v]",
             "t": str(duration),
-            "c:v": "libx264",
-            "preset": "medium",
         }
 
-        if input_bitrate:
-            ffmpeg_options["b:v"] = str(new_bitrate)
+        if is_output_gif:
+            output_options.update({
+                "f": "gif",
+                "loop": "0",
+            })
+        else:
+            output_options.update({
+                "c:v": "libx264",
+                "preset": "medium",
+                "pix_fmt": "yuv420p",
+            })
+            if new_bitrate:
+                output_options["b:v"] = str(new_bitrate)
 
-        ffmpeg = (
-            FFmpeg()
-            .option("y")
-            .option("stream_loop", "-1")
-            .input(str(input_path))
-            .output(str(output_path), ffmpeg_options)
-        )
+        # Add output
+        ffmpeg = ffmpeg.output(str(output_path), output_options)
 
         last_progress = 0
 
@@ -272,11 +303,9 @@ async def create_phase_grid(
         def on_progress(progress: Any) -> None: # noqa: ANN401
             nonlocal last_progress
             try:
-                 # Convert timedelta to seconds
                 current_time = progress.time.total_seconds()
                 current_progress = min(100, int((current_time / duration) * 100))
 
-                # Update progress bar
                 if current_progress > last_progress:
                     pbar.update(current_progress - last_progress)
                     last_progress = current_progress
@@ -284,10 +313,8 @@ async def create_phase_grid(
                 logger.exception("Progress update failed")
 
         try:
-            # Execute FFmpeg
             await ffmpeg.execute()
         finally:
-            # Make sure to close the progress bar
             pbar.close()
 
         # Verify output dimensions
@@ -303,7 +330,8 @@ async def create_phase_grid(
         logger.exception(str(error))
         raise error from e
 
-# Modify the main entry point to handle async
+
+
 def process_video(
     input_file: Union[str, Path],
     output_file: Union[str, Path],
