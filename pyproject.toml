@@ -27,7 +27,8 @@ select = ["ALL"]
 ignore = [
     "D203",  # one-blank-line-before-class (incompatible with no-blank-line-before-class)
     "D212",  # multi-line-summary-first-line (incompatible with multi-line-summary-second-line)
-    "FA"
+    "FA",
+    "PLE1205"
 ]
 
 # Allow autofix for all enabled rules (when `--fix`) is provided.

@@ -4,26 +4,46 @@
 import json
 import logging
 import os
+import sys
 from pathlib import Path
-from typing import Optional, Union
+from typing import Literal, Optional, Union
 
 import appeal
 from ffmpeg import FFmpeg
+
 
 # Constants
 FRAME_RATE_PARTS = 2
 DEFAULT_COLS = 3
 DEFAULT_ROWS = 2
 
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format="{asctime} - {levelname} - {message}",
-    style="{",
-)
+
+class BraceLogRecord(logging.LogRecord):
+    """LogRecord with support for {}-style formatting."""
+    def getMessage(self) -> str:  # noqa: N802
+        """Return properly formatted message with {} style support."""
+        msg = str(self.msg)
+        if self.args:
+            msg = msg.format(*self.args) if "{" in msg else msg % self.args
+        return msg
+
+LOG_FORMAT = "%(asctime)s - %(levelname)s - %(message)s"
+
+def setup_logging(mode: Literal["quiet", "verbose"]) -> None:
+    """Configure logging based on verbosity mode."""
+    logging.setLogRecordFactory(BraceLogRecord)
+
+    logger.handlers.clear()
+
+    if mode == "verbose":
+        handler = logging.StreamHandler(sys.stdout)
+        handler.setFormatter(logging.Formatter(LOG_FORMAT))
+        logger.addHandler(handler)
+        logger.setLevel(logging.INFO)
+    else:
+        logger.addHandler(logging.NullHandler())
+        logger.setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
-
-
 app = appeal.Appeal()
 
 
@@ -101,7 +121,7 @@ def get_video_info(file_path: Path) -> dict:
         fps_parts = stream_info.get("r_frame_rate", "").split("/")
         if len(fps_parts) != FRAME_RATE_PARTS:
             _handle_ffprobe_error(
-                f"Invalid frame rate format: {stream_info.get('r_frame_rate')}"
+                f"Invalid frame rate format: {stream_info.get('r_frame_rate')}",
             )
 
         fps = float(fps_parts[0]) / float(fps_parts[1])
@@ -114,7 +134,7 @@ def get_video_info(file_path: Path) -> dict:
         }
         logger.info("Video info: {}", info)
     except Exception as e:
-        logger.exception("Failed to get video information: {}", str(e))
+        logger.exception("Failed to get video information")
         msg = f"Failed to get video information: {e!s}"
         raise VideoProcessingError(msg) from e
     else:
@@ -122,7 +142,7 @@ def get_video_info(file_path: Path) -> dict:
 
 
 def _verify_output_dimensions(
-    output_info: dict, expected_width: int, expected_height: int
+    output_info: dict, expected_width: int, expected_height: int,
 ) -> None:
     """Verify output dimensions match expected dimensions."""
     if (output_info["width"], output_info["height"]) != (
@@ -170,7 +190,7 @@ def create_phase_grid(
                     f"[in{i}]trim=start={shift},setpts=PTS-STARTPTS[p{i}a]",
                     f"[in{i}]trim=duration={shift},setpts=PTS-STARTPTS[p{i}b]",
                     f"[p{i}a][p{i}b]concat[v{i}]",
-                ]
+                ],
             )
 
         # Create layout for xstack
@@ -185,7 +205,7 @@ def create_phase_grid(
 
         # Add xstack filter
         filter_complex.append(
-            f"{inputs}xstack=inputs={total_frames}:layout={layout_str}:shortest=1[vs]"
+            f"{inputs}xstack=inputs={total_frames}:layout={layout_str}:shortest=1[vs]",
         )
         filter_complex.append("[vs]format=yuv420p[v]")
 
@@ -226,7 +246,7 @@ def create_phase_grid(
         logger.info("Video processing completed successfully")
 
     except Exception as e:
-        logger.exception("Video processing failed: {}", str(e))
+        logger.exception("Video processing failed")
         msg = f"Video processing failed: {e!s}"
         raise VideoProcessingError(msg) from e
 
@@ -243,17 +263,18 @@ def phase_grid(
     input_file: str,
     output_file: str,
     geometry: str = f"{DEFAULT_COLS}x{DEFAULT_ROWS}",
+    mode: Literal["quiet", "verbose"] = "quiet",
 ) -> Optional[int]:
     """Create a grid of phase-shifted videos."""
+    setup_logging(mode)
     try:
-        logger.info("Starting phase grid creation with geometry {}", geometry)
+        logger.info("Starting grid creation: {}", geometry)
         cols, rows = map(int, geometry.split("x"))
         _validate_geometry(cols, rows)
         create_phase_grid(input_file, output_file, cols, rows)
-        logger.info("Phase grid creation completed successfully")
-    except Exception as e:
-        logger.exception("Phase grid creation failed: {}", str(e))
-        return 1
+        logger.info("Processing completed")
+    except Exception:
+        logger.exception("Processing failed")
     else:
         return None
 
