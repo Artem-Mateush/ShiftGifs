@@ -4,12 +4,15 @@
 import json
 import logging
 import os
+import re
 import sys
+import tempfile
 from pathlib import Path
 from typing import Annotated, Optional, Union
 
 import appeal
 from ffmpeg import FFmpeg
+from tqdm import tqdm
 
 
 # Constants
@@ -46,6 +49,17 @@ def setup_logging(*, verbose:bool=False) -> None:
 logger = logging.getLogger(__name__)
 app = appeal.Appeal()
 
+def _parse_progress_line(line: str) -> dict:
+    """Parse a single line of FFmpeg progress output."""
+    if not line:
+        return {}
+    
+    # Split the line into key-value pairs
+    parts = line.decode('utf-8').strip().split('=')
+    if len(parts) != 2:
+        return {}
+        
+    return {parts[0]: parts[1]}
 
 class VideoProcessingError(Exception):
     """Raised when video processing fails."""
@@ -94,7 +108,8 @@ def get_video_info(file_path: Path) -> dict:
             FFmpeg(executable="ffprobe")
             .option("v", "error")
             .option("select_streams", "v:0")
-            .option("show_entries", "stream=width,height,r_frame_rate:format=duration")
+            .option("show_entries", "stream=width,height,r_frame_rate"
+                    ",bit_rate:format=duration")
             .option("of", "json")
             .input(str(file_path))
         )
@@ -126,11 +141,18 @@ def get_video_info(file_path: Path) -> dict:
 
         fps = float(fps_parts[0]) / float(fps_parts[1])
 
+        # Get bitrate, fallback to format bitrate if stream bitrate is not available
+        bitrate = stream_info.get("bit_rate")
+        if not bitrate:
+            # If stream bitrate is not available, try format bitrate
+            bitrate = format_info.get("bit_rate")
+
         info = {
             "duration": float(format_info["duration"]),
             "width": int(stream_info["width"]),
             "height": int(stream_info["height"]),
             "fps": fps,
+            "bitrate": bitrate,
         }
         logger.info("Video info: {}", info)
     except Exception as e:
@@ -174,6 +196,17 @@ def create_phase_grid(
         info = get_video_info(input_path)
         duration = info["duration"]
 
+        # Calculate new bitrate for the grid
+        # Since we're creating a larger video, we should scale the bitrate
+        # proportionally to maintain quality
+        input_bitrate = info.get("bitrate")
+        if input_bitrate:
+            # Scale bitrate according to the number of grid cells
+            # Convert to int since some FFmpeg versions require integer bitrate
+            new_bitrate = int(int(input_bitrate) * (cols * rows))
+            logger.info("Scaling input bitrate {} to {} for grid",
+              input_bitrate, new_bitrate)
+
         # Build filter complex
         total_frames = cols * rows
         filter_complex = []
@@ -213,29 +246,79 @@ def create_phase_grid(
         filter_complex_str = ";".join(filter_complex)
         logger.debug("Filter complex: {}", filter_complex_str)
 
-        # Create FFmpeg command
-        ffmpeg = (
-            FFmpeg()
-            .option("y")
-            .option("stream_loop", "-1")
-            .input(str(input_path))
-            .output(
-                str(output_path),
-                {"filter_complex": filter_complex_str},
-                map="[v]",
-                t=str(duration),
-                **{"c:v": "libx264", "preset": "medium"},
+        # Create a temporary file for progress output
+        with tempfile.NamedTemporaryFile(mode='w+b', delete=True) as progress_file:
+            # Create FFmpeg command with progress output
+            ffmpeg_options = {
+                "filter_complex": filter_complex_str,
+                "map": "[v]",
+                "t": str(duration),
+                "c:v": "libx264",
+                "preset": "medium",
+            }
+            
+            if input_bitrate:
+                ffmpeg_options["b:v"] = str(new_bitrate)
+
+            ffmpeg = (
+                FFmpeg()
+                .option("y")
+                .option("stream_loop", "-1")
+                .option("progress", progress_file.name)
+                .input(str(input_path))
+                .output(
+                    str(output_path),
+                    ffmpeg_options,
+                )
             )
-        )
 
-        # Execute FFmpeg command
-        result = ffmpeg.execute()
+            # Start FFmpeg process
+            process = ffmpeg.execute(overwrite_output=True, pipe=True)
 
-        # Handle potential stderr output
-        if isinstance(result, tuple) and len(result) > 1:
-            stderr = result[1]
-            if stderr:
-                logger.warning("FFmpeg stderr: {}", stderr)
+            # Initialize progress bar
+            with tqdm(
+                total=100,
+                desc="Processing video",
+                bar_format='{l_bar}{bar}| {n_fmt}%',
+                unit="%"
+            ) as pbar:
+                last_progress = 0
+                
+                # Monitor progress file
+                while True:
+                    # Check if process is still running
+                    if process.poll() is not None:
+                        break
+                        
+                    # Read progress file
+                    progress_file.seek(0)
+                    progress_lines = progress_file.readlines()
+                    
+                    # Parse progress information
+                    progress_info = {}
+                    for line in progress_lines:
+                        progress_info.update(_parse_progress_line(line))
+                    
+                    # Calculate progress percentage
+                    if 'out_time_ms' in progress_info:
+                        try:
+                            time_ms = int(progress_info['out_time_ms'])
+                            current_progress = min(100, int((time_ms / 1000000) / duration * 100))
+                            
+                            # Update progress bar
+                            if current_progress > last_progress:
+                                pbar.update(current_progress - last_progress)
+                                last_progress = current_progress
+                        except (ValueError, ZeroDivisionError):
+                            continue
+                            
+                    # Small sleep to prevent excessive CPU usage
+                    process.stdout.flush()
+                    process.stderr.flush()
+                    
+            # Check if process completed successfully
+            if process.returncode != 0:
+                raise VideoProcessingError(f"FFmpeg process failed with return code {process.returncode}")
 
         # Verify output dimensions
         output_info = get_video_info(output_path)
