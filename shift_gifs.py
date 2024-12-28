@@ -1,17 +1,15 @@
 #!/usr/bin/env python3
 """Create phase-shifted video grids using python-ffmpeg."""
 
+import asyncio
 import json
 import logging
 import os
-import re
 import sys
-import tempfile
 from pathlib import Path
 from typing import Annotated, Optional, Union
 
 import appeal
-import asyncio
 from ffmpeg.asyncio import FFmpeg
 from tqdm import tqdm
 
@@ -54,12 +52,12 @@ def _parse_progress_line(line: str) -> dict:
     """Parse a single line of FFmpeg progress output."""
     if not line:
         return {}
-    
+
     # Split the line into key-value pairs
-    parts = line.decode('utf-8').strip().split('=')
+    parts = line.decode("utf-8").strip().split("=")
     if len(parts) != 2:
         return {}
-        
+
     return {parts[0]: parts[1]}
 
 class VideoProcessingError(Exception):
@@ -138,7 +136,7 @@ async def get_video_info(file_path: Path) -> dict:
             )
 
         fps = float(fps_parts[0]) / float(fps_parts[1])
-        
+
         # Get bitrate, fallback to format bitrate if stream bitrate is not available
         bitrate = stream_info.get("bit_rate")
         if not bitrate:
@@ -244,54 +242,56 @@ async def create_phase_grid(
         filter_complex_str = ";".join(filter_complex)
         logger.debug("Filter complex: {}", filter_complex_str)
 
-        # Create a temporary file for progress output
-        with tempfile.NamedTemporaryFile(mode='w+b', delete=True) as progress_file:
-            ffmpeg_options = {
-                "filter_complex": filter_complex_str,
-                "map": "[v]",
-                "t": str(duration),
-                "c:v": "libx264",
-                "preset": "medium",
-            }
-            
-            if input_bitrate:
-                ffmpeg_options["b:v"] = str(new_bitrate)
+        # Initialize progress bar outside the FFmpeg execution
+        pbar = tqdm(
+            total=100,
+            desc="Processing video",
+            bar_format="{l_bar}{bar}| {n_fmt}%",
+            unit="%",
+        )
 
-            ffmpeg = (
-                FFmpeg()
-                .option("y")
-                .option("stream_loop", "-1")
-                .option("progress", progress_file.name)
-                .input(str(input_path))
-                .output(str(output_path), ffmpeg_options)
-            )
+        ffmpeg_options = {
+            "filter_complex": filter_complex_str,
+            "map": "[v]",
+            "t": str(duration),
+            "c:v": "libx264",
+            "preset": "medium",
+        }
 
-            # Initialize progress bar
-            with tqdm(
-                total=100,
-                desc="Processing video",
-                bar_format='{l_bar}{bar}| {n_fmt}%',
-                unit="%"
-            ) as pbar:
-                last_progress = 0
-                
-                @ffmpeg.on('progress')
-                def on_progress(progress):
-                    nonlocal last_progress
-                    try:
-                        # Calculate progress based on time
-                        time_ms = progress.time * 1000000  # Convert to microseconds
-                        current_progress = min(100, int((time_ms / 1000000) / duration * 100))
-                        
-                        # Update progress bar
-                        if current_progress > last_progress:
-                            pbar.update(current_progress - last_progress)
-                            last_progress = current_progress
-                    except (AttributeError, TypeError, ZeroDivisionError):
-                        pass
+        if input_bitrate:
+            ffmpeg_options["b:v"] = str(new_bitrate)
 
-                # Execute FFmpeg
-                await ffmpeg.execute()
+        ffmpeg = (
+            FFmpeg()
+            .option("y")
+            .option("stream_loop", "-1")
+            .input(str(input_path))
+            .output(str(output_path), ffmpeg_options)
+        )
+
+        last_progress = 0
+
+        @ffmpeg.on("progress")
+        def on_progress(progress):
+            nonlocal last_progress
+            try:
+                 # Convert timedelta to seconds
+                current_time = progress.time.total_seconds()
+                current_progress = min(100, int((current_time / duration) * 100))
+
+                # Update progress bar
+                if current_progress > last_progress:
+                    pbar.update(current_progress - last_progress)
+                    last_progress = current_progress
+            except Exception as e:
+                logger.warning(f"Progress update failed: {e}")
+
+        try:
+            # Execute FFmpeg
+            await ffmpeg.execute()
+        finally:
+            # Make sure to close the progress bar
+            pbar.close()
 
         # Verify output dimensions
         output_info = await get_video_info(output_path)
