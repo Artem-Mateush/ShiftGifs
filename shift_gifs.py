@@ -66,7 +66,7 @@ class VideoProcessingError(Exception):
 
 def is_gif(file_path: Path) -> bool:
     """Check if the file is a GIF."""
-    return file_path.suffix.lower() == '.gif'
+    return file_path.suffix.lower() == ".gif"
 
 
 def validate_input_file(file_path: Union[str, Path]) -> Path:
@@ -110,7 +110,7 @@ async def get_video_info(file_path: Path) -> dict:
         # Create ffprobe command
         ffprobe = (
             FFmpeg(executable="ffprobe")
-            .option("v", "error")
+            .option("v", "warning")
             .option("select_streams", "v:0")
             .option("show_entries", "stream=width,height,r_frame_rate"
                     ",bit_rate:format=duration")
@@ -179,7 +179,7 @@ def _verify_output_dimensions(
         _handle_ffprobe_error(msg)
 
 
-def _create_filter_complex(cols: int, rows: int, duration: float) -> str:
+def _create_filter_complex(cols: int, rows: int, duration: float, is_output_gif: bool = False) -> str:
     """Create the FFmpeg filter complex string."""
     total_frames = cols * rows
     filter_complex = []
@@ -207,15 +207,17 @@ def _create_filter_complex(cols: int, rows: int, duration: float) -> str:
             layout.append(f"{x}_{y}")
     layout_str = "|".join(layout)
 
+    # For GIFs, output directly to [v]
+    final_output = "[v]" if is_output_gif else "[vs]"
     filter_complex.append(
-        f"{inputs}xstack=inputs={total_frames}:layout={layout_str}:shortest=1[vs]",
+        f"{inputs}xstack=inputs={total_frames}:layout={layout_str}:shortest=1{final_output}",
     )
-    
-    # For GIFs, we don't need yuv420p format
-    filter_complex.append("[vs]split[v]")
+
+    # Only add split for non-GIF outputs
+    if not is_output_gif:
+        filter_complex.append("[vs]split[v]")
 
     return ";".join(filter_complex)
-
 
 async def create_phase_grid(
     input_file: Union[str, Path],
@@ -227,7 +229,7 @@ async def create_phase_grid(
     try:
         input_path = validate_input_file(input_file)
         output_path = validate_output_file(output_file)
-        is_input_gif = is_gif(input_path)
+        is_gif(input_path)
         is_output_gif = is_gif(output_path)
 
         logger.info("Processing video: {} -> {}", input_path, output_path)
@@ -237,16 +239,7 @@ async def create_phase_grid(
         info = await get_video_info(input_path)
         duration = info["duration"]
 
-        # Calculate new bitrate for the grid (only for non-GIF outputs)
-        new_bitrate = None
-        if not is_output_gif:
-            input_bitrate = info.get("bitrate")
-            if input_bitrate:
-                new_bitrate = int(int(input_bitrate) * (cols * rows))
-                logger.info("Scaling input bitrate {} to {} for grid",
-                    input_bitrate, new_bitrate)
-
-        filter_complex_str = _create_filter_complex(cols, rows, duration)
+        filter_complex_str = _create_filter_complex(cols, rows, duration, is_output_gif)
 
         # Initialize progress bar
         pbar = tqdm(
@@ -256,46 +249,54 @@ async def create_phase_grid(
             unit="%",
         )
 
-        # Create FFmpeg command
-        ffmpeg = FFmpeg().option("y")
+        # Build FFmpeg command
+        ffmpeg = (
+            FFmpeg()
+            .option("y")
+            .option("v", "debug")  # Add debug output
+            .option("loglevel", "debug")
+            .option("stream_loop", "-1")
+            .input(str(input_path))
+        )
 
-        # Add input options for GIF
-        if is_input_gif:
+        # Set output options based on format
+        if is_output_gif:
             ffmpeg = (
                 ffmpeg
-                .option("stream_loop", "-1")
-                .option("ignore_loop", "0")
-                .option("pattern_type", "none")
+                .output(
+                    str(output_path),
+                    {
+                        "filter_complex": filter_complex_str,
+                        "map": "[v]",
+                        "f": "gif",
+                        "vsync": "1",
+                        "fps_mode": "cfr"
+
+                    },
+                )
             )
         else:
-            ffmpeg = ffmpeg.option("stream_loop", "-1")
+        # Calculate new bitrate for the grid (only for non-GIF outputs)
+            input_bitrate = info.get("bitrate")
+            new_bitrate = int(int(input_bitrate) * (cols * rows))
+            logger.info("Scaling input bitrate {} to {} for grid",
+                input_bitrate, new_bitrate)
 
-        # Add input
-        ffmpeg = ffmpeg.input(str(input_path))
 
-        # Output options
-        output_options = {
-            "filter_complex": filter_complex_str,
-            "map": "[v]",
-            "t": str(duration),
-        }
-
-        if is_output_gif:
-            output_options.update({
-                "f": "gif",
-                "loop": "0",
-            })
-        else:
-            output_options.update({
-                "c:v": "libx264",
-                "preset": "medium",
-                "pix_fmt": "yuv420p",
-            })
-            if new_bitrate:
-                output_options["b:v"] = str(new_bitrate)
-
-        # Add output
-        ffmpeg = ffmpeg.output(str(output_path), output_options)
+            ffmpeg = (
+                ffmpeg
+                .output(
+                    str(output_path),
+                    {
+                        "filter_complex": filter_complex_str,
+                        "map": "[v]",
+                        "c:v": "libx264",
+                        "preset": "medium",
+                        "pix_fmt": "yuv420p",
+                        "b:v": new_bitrate,
+                    },
+                )
+            )
 
         last_progress = 0
 
@@ -313,7 +314,19 @@ async def create_phase_grid(
                 logger.exception("Progress update failed")
 
         try:
-            await ffmpeg.execute()
+            process = await asyncio.create_subprocess_exec(
+                *ffmpeg.arguments,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            stdout, stderr = await process.communicate()
+            logger.error("FFmpeg stderr: {}", stderr.decode() if stderr else "None")
+            logger.error("FF1mpeg return code: {}", process.returncode)
+
+            if process.returncode != 0:
+                raise Exception(f"FFmpeg failed with return code {process.returncode}")
+
+
         finally:
             pbar.close()
 
