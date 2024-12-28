@@ -18,7 +18,8 @@ from tqdm import tqdm
 FRAME_RATE_PARTS = 2
 DEFAULT_COLS = 3
 DEFAULT_ROWS = 2
-
+DEFAULT_SCALE_FACTOR = 1.0
+DEFAULT_BITRATE_FACTOR = 1.0
 
 class BraceLogRecord(logging.LogRecord):
     """LogRecord with support for {}-style formatting."""
@@ -165,12 +166,15 @@ async def get_video_info(file_path: Path) -> dict:
 
 
 def _verify_output_dimensions(
-    output_info: dict, expected_width: int, expected_height: int,
+    output_info: dict,
+    expected_width: int,
+    expected_height: int,
+    scale_factor: float
 ) -> None:
     """Verify output dimensions match expected dimensions."""
     if (output_info["width"], output_info["height"]) != (
-        expected_width,
-        expected_height,
+        int(expected_width * scale_factor),
+        int(expected_height * scale_factor),
     ):
         msg = (
             f"Output dimensions {output_info['width']}x{output_info['height']} "
@@ -184,6 +188,7 @@ def _create_filter_complex(
         rows: int,
         duration: float,
         output_type: Literal["gif", "video"] = "video",
+        scale_factor: float = DEFAULT_SCALE_FACTOR,
     ) -> str:
     """Create the FFmpeg filter complex string."""
     total_frames = cols * rows
@@ -212,22 +217,37 @@ def _create_filter_complex(
             layout.append(f"{x}_{y}")
     layout_str = "|".join(layout)
 
-    # For GIFs, ensure proper frame timing with fps filter
-    if output_type == "gif":
+    # Stack the videos
+    filter_complex.append(
+        f"{inputs}xstack=inputs={total_frames}:layout={layout_str}[stacked]",
+    )
+
+    # Apply scaling if needed
+    if scale_factor != DEFAULT_SCALE_FACTOR:
         filter_complex.append(
-            f"{inputs}xstack=inputs={total_frames}:layout={layout_str}:shortest=1,fps=30[v]",
+            f"[stacked]scale=iw*{scale_factor}:ih*{scale_factor}[out]",
         )
     else:
-        filter_complex.append(
-            f"{inputs}xstack=inputs={total_frames}:layout={layout_str}:shortest=1[v]",
-        )
+        filter_complex.append("[stacked]copy[out]")
+
+    # For GIFs, add optimization filters
+    if output_type == "gif":
+        filter_complex.extend([
+            "[out]fps=15,split[x1][x2]",
+            "[x1]palettegen=max_colors=128:stats_mode=single[p]",
+            "[x2][p]paletteuse=dither=floyd_steinberg",
+        ])
 
     return ";".join(filter_complex)
+
 async def create_phase_grid(
     input_file: Union[str, Path],
     output_file: Union[str, Path],
     cols: int = DEFAULT_COLS,
     rows: int = DEFAULT_ROWS,
+    *,
+    scale_factor: float = DEFAULT_SCALE_FACTOR,
+    bitrate_factor: float = DEFAULT_BITRATE_FACTOR,
 ) -> None:
     """Create a grid of phase-shifted videos."""
     try:
@@ -241,10 +261,14 @@ async def create_phase_grid(
         # Get video information
         info = await get_video_info(input_path)
         duration = info["duration"]
-        info["fps"]
 
-        filter_complex_str = _create_filter_complex(cols, rows, duration,
-            output_type="gif" if is_output_gif else "video")
+        filter_complex_str = _create_filter_complex(
+            cols,
+            rows,
+            duration,
+            output_type="gif" if is_output_gif else "video",
+            scale_factor=scale_factor,
+        )
 
         # Initialize progress bar
         pbar = tqdm(
@@ -258,10 +282,13 @@ async def create_phase_grid(
         ffmpeg = (
             FFmpeg()
             .option("y")
-            .option("v", "debug")
-            .option("loglevel", "debug")
+            .option("v", "warning")
+            .option("progress", "pipe:1")
+            .option("stats_period", "0.1")
             .input(str(input_path))
         )
+
+        last_progress = 0
 
         # Set output options based on format
         if is_output_gif:
@@ -269,18 +296,15 @@ async def create_phase_grid(
                 ffmpeg
                 .output(
                     str(output_path),
-                    {
-                        "filter_complex": filter_complex_str,
-                        "map": "[v]",
-                        "f": "gif",
-                        "vsync": "2",
-                    },
+                    filter_complex=filter_complex_str,
+                    f="gif",
+                    vsync="2",
                 )
             )
         else:
-            # Calculate new bitrate for the grid (only for non-GIF outputs)
+            # Calculate new bitrate for the grid
             input_bitrate = info.get("bitrate")
-            new_bitrate = int(int(input_bitrate) * (cols * rows))
+            new_bitrate = int(int(input_bitrate) * (cols * rows) * bitrate_factor)
             logger.info("Scaling input bitrate {} to {} for grid",
                 input_bitrate, new_bitrate)
 
@@ -288,18 +312,21 @@ async def create_phase_grid(
                 ffmpeg
                 .output(
                     str(output_path),
-                    {
-                        "filter_complex": filter_complex_str,
-                        "map": "[v]",
-                        "c:v": "libx264",
-                        "preset": "medium",
-                        "pix_fmt": "yuv420p",
-                        "b:v": new_bitrate,
-                    },
+                    filter_complex=filter_complex_str,
+                    map="[out]",
+                    c="libx264",
+                    preset="veryslow",
+                    crf="28",
+                    pix_fmt="yuv420p",
+                    b="{}".format(new_bitrate),
+                    maxrate="{}".format(new_bitrate * 1.5),
+                    bufsize="{}".format(new_bitrate * 2),
+                    profile="baseline",
+                    level="3.0",
+                    tune="film",
                 )
             )
 
-        last_progress = 0
 
         @ffmpeg.on("progress")
         def on_progress(progress: Any) -> None: # noqa: ANN401
@@ -325,7 +352,7 @@ async def create_phase_grid(
         expected_width = info["width"] * cols
         expected_height = info["height"] * rows
 
-        _verify_output_dimensions(output_info, expected_width, expected_height)
+        _verify_output_dimensions(output_info, expected_width, expected_height, scale_factor=scale_factor)
         logger.info("Video processing completed successfully")
 
     except Exception as e:
@@ -340,9 +367,18 @@ def process_video(
     output_file: Union[str, Path],
     cols: int = DEFAULT_COLS,
     rows: int = DEFAULT_ROWS,
+    *,
+    scale_factor: float = DEFAULT_SCALE_FACTOR,
+    bitrate_factor: float = DEFAULT_BITRATE_FACTOR,
 ) -> None:
     """Wrapper function to run the async create_phase_grid."""
-    asyncio.run(create_phase_grid(input_file, output_file, cols, rows))
+    asyncio.run(create_phase_grid(
+        input_file,
+        output_file,
+        cols, rows,
+        scale_factor=scale_factor,
+        bitrate_factor=bitrate_factor,
+    ))
 
 
 def _validate_geometry(cols: int, rows: int) -> None:
@@ -351,13 +387,15 @@ def _validate_geometry(cols: int, rows: int) -> None:
         msg = "Geometry values must be positive"
         raise ValueError(msg)
 
-
+FactorType = Annotated[float, appeal.validate_range(0.001, 1.0, type=float)]
 @app.global_command()
 def shift_gifs(
     input_file: str,
     output_file: Annotated[Optional[str], str] = None,
     *,
     geometry: str = f"{DEFAULT_COLS}x{DEFAULT_ROWS}",
+    scale: FactorType = DEFAULT_SCALE_FACTOR,
+    bitrate_factor: FactorType = DEFAULT_BITRATE_FACTOR,
     verbose: bool = False,
 ) -> Optional[int]:
     """Create a grid of phase-shifted videos.
@@ -368,13 +406,13 @@ def shift_gifs(
           If not provided, will use input path with '_shifted' suffix
         geometry: Grid dimensions in format 'COLSxROWS',
           e.g. '3x2' for 3 columns and 2 rows
+        scale: Scale factor for output size (e.g., 0.5 for half size)
+        bitrate_factor: How much reduce quality (default 0.5 for 50%)
         verbose: Verbose logging output
     """
     if output_file is None:
-        # Get input path without extension
         input_path = Path(input_file)
         stem = input_path.stem
-        # Create output path with _shifted suffix and same extension
         output_file = str(input_path.with_stem(f"{stem}_shifted"))
 
     setup_logging(verbose=verbose)
@@ -382,7 +420,8 @@ def shift_gifs(
         logger.info("Starting grid creation: {}", geometry)
         cols, rows = map(int, geometry.split("x"))
         _validate_geometry(cols, rows)
-        process_video(input_file, output_file, cols, rows)
+        process_video(input_file, output_file, cols, rows,
+          scale_factor=scale, bitrate_factor=bitrate_factor)
         logger.info("Processing completed")
     except Exception:
         logger.exception("Processing failed")
