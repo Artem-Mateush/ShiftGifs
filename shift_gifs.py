@@ -207,18 +207,17 @@ def _create_filter_complex(cols: int, rows: int, duration: float, is_output_gif:
             layout.append(f"{x}_{y}")
     layout_str = "|".join(layout)
 
-    # For GIFs, output directly to [v]
-    final_output = "[v]" if is_output_gif else "[vs]"
-    filter_complex.append(
-        f"{inputs}xstack=inputs={total_frames}:layout={layout_str}:shortest=1{final_output}",
-    )
-
-    # Only add split for non-GIF outputs
-    if not is_output_gif:
-        filter_complex.append("[vs]split[v]")
+    # For GIFs, ensure proper frame timing with fps filter
+    if is_output_gif:
+        filter_complex.append(
+            f"{inputs}xstack=inputs={total_frames}:layout={layout_str}:shortest=1,fps=30[v]"
+        )
+    else:
+        filter_complex.append(
+            f"{inputs}xstack=inputs={total_frames}:layout={layout_str}:shortest=1[v]"
+        )
 
     return ";".join(filter_complex)
-
 async def create_phase_grid(
     input_file: Union[str, Path],
     output_file: Union[str, Path],
@@ -229,7 +228,6 @@ async def create_phase_grid(
     try:
         input_path = validate_input_file(input_file)
         output_path = validate_output_file(output_file)
-        is_gif(input_path)
         is_output_gif = is_gif(output_path)
 
         logger.info("Processing video: {} -> {}", input_path, output_path)
@@ -238,6 +236,7 @@ async def create_phase_grid(
         # Get video information
         info = await get_video_info(input_path)
         duration = info["duration"]
+        fps = info["fps"]
 
         filter_complex_str = _create_filter_complex(cols, rows, duration, is_output_gif)
 
@@ -253,9 +252,8 @@ async def create_phase_grid(
         ffmpeg = (
             FFmpeg()
             .option("y")
-            .option("v", "debug")  # Add debug output
+            .option("v", "debug")
             .option("loglevel", "debug")
-            .option("stream_loop", "-1")
             .input(str(input_path))
         )
 
@@ -269,19 +267,16 @@ async def create_phase_grid(
                         "filter_complex": filter_complex_str,
                         "map": "[v]",
                         "f": "gif",
-                        "vsync": "1",
-                        "fps_mode": "cfr"
-
+                        "vsync": "2",
                     },
                 )
             )
         else:
-        # Calculate new bitrate for the grid (only for non-GIF outputs)
+            # Calculate new bitrate for the grid (only for non-GIF outputs)
             input_bitrate = info.get("bitrate")
             new_bitrate = int(int(input_bitrate) * (cols * rows))
             logger.info("Scaling input bitrate {} to {} for grid",
                 input_bitrate, new_bitrate)
-
 
             ffmpeg = (
                 ffmpeg
@@ -321,7 +316,7 @@ async def create_phase_grid(
             )
             stdout, stderr = await process.communicate()
             logger.error("FFmpeg stderr: {}", stderr.decode() if stderr else "None")
-            logger.error("FF1mpeg return code: {}", process.returncode)
+            logger.error("FFmpeg return code: {}", process.returncode)
 
             if process.returncode != 0:
                 raise Exception(f"FFmpeg failed with return code {process.returncode}")
